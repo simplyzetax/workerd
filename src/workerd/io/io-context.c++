@@ -642,6 +642,19 @@ void IoContext::logUncaughtExceptionAsync(UncaughtExceptionSource source,
       runnable, Worker::Lock::TakeSynchronously(metrics), kj::none, Runnable::Exceptional(true));
 }
 
+void IoContext::requireCurrentIncomingRequestForRun() {
+  if (incomingRequests.empty()) {
+    // An actor between events can get here legitimately, so callers see only a JavaScript error.
+    // For the cases that are bugs, log where the context's last request was delivered.
+    LOG_PERIODICALLY(WARNING, "NOSENTRY IoContext::run() without a current IncomingRequest",
+        lastDeliveredLocation, kj::getStackTrace());
+    auto e = JSG_KJ_EXCEPTION(FAILED, Error,
+        "Couldn't complete operation because the execution context has no request in progress.");
+    e.setDetail(NO_CURRENT_INCOMING_REQUEST_DETAIL_ID, kj::heapArray<kj::byte>(0));
+    kj::throwFatalException(kj::mv(e));
+  }
+}
+
 void IoContext::abort(kj::Exception&& e) {
   if (abortException != kj::none) {
     return;
