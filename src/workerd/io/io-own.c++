@@ -3,6 +3,7 @@
 #include "io-context.h"
 
 #include <workerd/jsg/util.h>
+#include <workerd/util/sentry.h>
 
 namespace workerd {
 
@@ -69,6 +70,30 @@ bool DeleteQueue::isDefunct() const {
   return *crossThreadDeleteQueue.lockShared() == kj::none;
 }
 
+kj::Array<kj::Function<void(jsg::Lock&)>> DeleteQueue::takeActions() const {
+  auto lock = crossThreadDeleteQueue.lockExclusive();
+  KJ_IF_SOME(state, *lock) {
+    return state.actions.releaseAsArray();
+  }
+  return nullptr;
+}
+
+bool DeleteQueue::hasQueuedActions() const {
+  auto lock = crossThreadDeleteQueue.lockShared();
+  KJ_IF_SOME(state, *lock) {
+    return !state.actions.empty();
+  }
+  return false;
+}
+
+size_t DeleteQueue::getQueuedActionCountForTest() const {
+  auto lock = crossThreadDeleteQueue.lockShared();
+  KJ_IF_SOME(state, *lock) {
+    return state.actions.size();
+  }
+  return 0;
+}
+
 void DeleteQueue::checkFarGet(const DeleteQueue& deleteQueue, const std::type_info& type) {
   IoContext::current().checkFarGet(deleteQueue, type);
 }
@@ -90,6 +115,26 @@ kj::Promise<void> DeleteQueue::resetCrossThreadSignal() const {
     return kj::mv(paf.promise);
   } else {
     return kj::NEVER_DONE;
+  }
+}
+
+DeleteQueuePtr::~DeleteQueuePtr() noexcept(false) {
+  auto ptr = queue.get();
+  if (ptr != nullptr) {
+    auto lock = ptr->crossThreadDeleteQueue.lockExclusive();
+    KJ_IF_SOME(state, *lock) {
+      if (!state.actions.empty()) {
+        LOG_PERIODICALLY(WARNING, "NOSENTRY IoContext destroyed with cross-context actions queued",
+            state.actions.size());
+      }
+      // The delete queue state may include a kj::CrossThreadPromiseFulfiller that
+      // needs to be destroyed. To do so, we need to allow async destructors here.
+      // We only want to destroy the crossThreadFulfiller in this scope tho, not
+      // everything that may be in the queue.
+      kj::AllowAsyncDestructorsScope scope;
+      state.crossThreadFulfiller = kj::none;
+    }
+    *lock = kj::none;
   }
 }
 
@@ -135,6 +180,10 @@ bool IoCrossContextExecutor::tryExecute(kj::Function<void(jsg::Lock&)>&& func) c
 
 bool IoCrossContextExecutor::isTargetDestroyed() const {
   return deleteQueue->isDefunct();
+}
+
+size_t IoCrossContextExecutor::getQueuedActionCountForTest() const {
+  return deleteQueue->getQueuedActionCountForTest();
 }
 
 }  // namespace workerd

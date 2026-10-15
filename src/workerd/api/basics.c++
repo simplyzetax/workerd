@@ -1221,6 +1221,13 @@ int AbortSignal::getNativeRegistrationCountForTest() {
   return static_cast<int>(nativeRegistrations.size() + rpcRegistrations.size());
 }
 
+int AbortSignal::getRpcReceiverQueuedActionCountForTest() {
+  KJ_IF_SOME(executor, rpcReceiverContext) {
+    return static_cast<int>(executor.getQueuedActionCountForTest());
+  }
+  return 0;
+}
+
 void AbortSignal::skipReleaseForTest() {
   for (auto& reg: rpcRegistrations) {
     KJ_IF_SOME(client, take(reg->client)) {
@@ -1298,17 +1305,22 @@ void AbortSignal::subscribeToRpcAbort(jsg::Lock& js) {
   if (!isRpcReceiverContextCurrent()) {
     // Only the request that deserialized this signal can arm the subscription — it owns the
     // underlying promise — but a signal retained across requests may see registrations from
-    // other contexts. Ask the receiving context to arm on its next turn. The queued action
-    // captures only a WeakRef, which is safe to destroy from any thread should that context
-    // be torn down without draining its queue. If the context is already gone, the request
-    // is dropped: no delivery is possible anymore, though the abort itself stays observable
-    // through the pending-reason box (see docs/reference/detail/abort-signal.md).
-    KJ_IF_SOME(executor, rpcReceiverContext) {
-      executor.tryExecute([weakSelf = JSG_THIS_WEAK(js)](jsg::Lock& js) {
-        KJ_IF_SOME(self, weakSelf.tryGet()) {
-          self.subscribeToRpcAbort(js);
-        }
-      });
+    // other contexts. Ask the receiving context to arm on its next turn, or for an actor between
+    // events, at its next event, queuing the request only once (see rpcSubscriptionRequested).
+    // The queued action captures only a WeakRef, which is safe to destroy from any thread
+    // should that context be torn down without draining its queue. If the context is already
+    // gone, the request is dropped: no delivery is possible anymore, though the abort itself
+    // stays observable through the pending-reason box (see
+    // docs/reference/detail/abort-signal.md).
+    if (!rpcSubscriptionRequested) {
+      KJ_IF_SOME(executor, rpcReceiverContext) {
+        rpcSubscriptionRequested =
+            executor.tryExecute([weakSelf = JSG_THIS_WEAK(js)](jsg::Lock& js) {
+          KJ_IF_SOME(self, weakSelf.tryGet()) {
+            self.subscribeToRpcAbort(js);
+          }
+        });
+      }
     }
     return;
   }

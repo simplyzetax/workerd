@@ -346,7 +346,8 @@ void IoContext::IncomingRequest::delivered(kj::SourceLocation location) {
 
 void IoContext::IncomingRequest::delivered(kj::StringPtr eventType, kj::SourceLocation location) {
   KJ_REQUIRE(!wasDelivered, "delivered() can only be called once");
-  if (!context->incomingRequests.empty()) {
+  bool hadRequest = !context->incomingRequests.empty();
+  if (hadRequest) {
     // There is already an IncomingRequest running in this context, and we're going to make it no
     // longer current. Make sure to attribute accumulated CPU time to it.
     auto& oldFront = context->incomingRequests.front();
@@ -394,6 +395,13 @@ void IoContext::IncomingRequest::delivered(kj::StringPtr eventType, kj::SourceLo
 
     // Record a new incoming request to actor metrics.
     a.getMetrics().startRequest();
+  }
+
+  if (!hadRequest && context->deleteQueue.queue->hasQueuedActions()) {
+    // Cross-context actions are only left queued while the context has no request in progress.
+    // Run them as part of this request, as a waitUntil task, so that the request can't finish
+    // draining before they have run, however short its own event is.
+    context->addWaitUntil(context->runQueuedActions());
   }
 }
 
@@ -1983,25 +1991,54 @@ jsg::JsObject IoContext::getPromiseContextTag(jsg::Lock& js) {
 kj::Promise<void> IoContext::startDeleteQueueSignalTask(IoContext* context) {
   // The promise that is returned is held by the IoContext itself, so when the
   // IoContext is destroyed, the promise will be canceled and the loop will
-  // end. On each iteration of the loop we want to reset the cross thread
-  // signal in the delete queue, then wait on the promise. Once the promise
-  // is fulfilled, we will run an empty task to prompt the IoContext to drain
-  // the DeleteQueue.
+  // end. On each iteration of the loop we wait for the delete queue's cross
+  // thread signal, then run the queued actions.
   try {
+    auto& queue = *context->deleteQueue.queue;
+    auto signal = queue.resetCrossThreadSignal();
     for (;;) {
-      co_await context->deleteQueue.queue->resetCrossThreadSignal();
-      co_await context->run([](auto& lock) {
-        auto& context = IoContext::current();
-        auto l = context.deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
-        auto& state = KJ_ASSERT_NONNULL(*l);
-        for (auto& action: state.actions) {
-          action(lock);
-        }
-        state.actions.clear();
-      });
+      co_await signal;
+
+      // Re-arm before running the actions, so that an action scheduled while they run fulfills
+      // this fresh signal instead of the one we just consumed.
+      signal = queue.resetCrossThreadSignal();
+
+      // Without a request to run the actions under, as with an actor between events, they stay
+      // queued until delivered() runs them for the next one. A wake can also find that an earlier
+      // run already took them.
+      if (context->incomingRequests.empty() || !queue.hasQueuedActions()) {
+        continue;
+      }
+
+      co_await context->runQueuedActions();
+      if (context->abortException != kj::none) {
+        co_return;
+      }
     }
   } catch (...) {
     context->abort(kj::getCaughtExceptionAsKj());
+  }
+}
+
+kj::Promise<void> IoContext::runQueuedActions() {
+  bool tookActions = false;
+  try {
+    co_await run([&tookActions](Worker::Lock& lock, IoContext& context) {
+      // An action is free to schedule another, so they're all taken out of the queue first.
+      tookActions = true;
+      for (auto& action: context.deleteQueue.queue->takeActions()) {
+        action(lock);
+      }
+    });
+  } catch (...) {
+    auto e = kj::getCaughtExceptionAsKj();
+    // Only a run that lost its request while it waited for a lock leaves the actions queued, for
+    // the next request to run. Anything else aborts the context, including an action's failure,
+    // whatever details its exception carries.
+    if (tookActions || abortException != kj::none ||
+        e.getDetail(NO_CURRENT_INCOMING_REQUEST_DETAIL_ID) == kj::none) {
+      abort(kj::mv(e));
+    }
   }
 }
 }  // namespace workerd

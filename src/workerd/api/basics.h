@@ -650,9 +650,11 @@ class AbortSignal final: public EventTarget {
     if (flags.getWorkerdExperimental()) {
       JSG_METHOD(skipReleaseForTest);
       JSG_METHOD(getNativeRegistrationCountForTest);
+      JSG_METHOD(getRpcReceiverQueuedActionCountForTest);
       JSG_TS_OVERRIDE({
         skipReleaseForTest: never;
         getNativeRegistrationCountForTest: never;
+        getRpcReceiverQueuedActionCountForTest: never;
       });
     }
   }
@@ -760,6 +762,11 @@ class AbortSignal final: public EventTarget {
   // a sweep) plus RPC registrations currently held by this signal. Lets tests assert that
   // completed registrations are reclaimed rather than accumulating on long-lived signals.
   int getNativeRegistrationCountForTest();
+
+  // Test-only introspection: for a signal received over RPC, the number of cross-context actions
+  // queued on the IoContext that received it, or 0 if there is no such context. Lets tests assert
+  // that requests to arm the RPC subscription don't accumulate while that context is idle.
+  int getRpcReceiverQueuedActionCountForTest();
 
   static jsg::Ref<AbortSignal> deserialize(
       jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
@@ -904,6 +911,12 @@ class AbortSignal final: public EventTarget {
   // receiving context is already gone.
   kj::Maybe<IoCrossContextExecutor> rpcReceiverContext;
   bool isRpcReceiverContextCurrent();
+
+  // Whether a request to arm the RPC subscription has been queued on rpcReceiverContext. Only one
+  // is ever queued: until that context runs it, which for an actor between events means at its
+  // next event, other contexts can register any number of observers. It never needs repeating:
+  // running it arms the subscription, and if that context is destroyed first, nothing can.
+  bool rpcSubscriptionRequested = false;
 
   // A promise that is fulfilled if an abort() message is received over RPC.
   kj::Maybe<IoOwn<kj::Promise<void>>> rpcAbortPromise;

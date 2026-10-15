@@ -92,10 +92,17 @@ class DeleteQueue: public kj::AtomicRefcounted {
 
   void scheduleDeletion(OwnedObject* object) const;
 
-  // Schedules the given action to run in the IoContext that owns this queue, the next time
-  // that context drains its queue (in its own thread, under the isolate lock). If the owning
-  // IoContext has already been destroyed, the action is dropped and a warning about
-  // cross-request promise resolution is logged to the current context, if any.
+  // Schedules the given action to run in the IoContext that owns this queue, in its own thread
+  // under the isolate lock. Like any other event, the action waits for the input lock and runs
+  // under the context's current IncomingRequest: it counts toward that request's limits, appears
+  // in its logs and traces, and has no ordering guarantee relative to the request's own handler.
+  // If the context has no request in progress, as with an actor between events, the action stays
+  // queued until its next request is delivered, however long that takes. A caller that can queue
+  // actions repeatedly without allocating on the JS heap, e.g. actions holding only a weak
+  // reference, must coalesce them, so that the isolate's memory limit still bounds the queue. If
+  // the owning IoContext is destroyed before the action runs, the action is dropped. If it has
+  // already been destroyed, the action is dropped and a warning about cross-request promise
+  // resolution is logged to the current context, if any.
   void scheduleAction(jsg::Lock& js, kj::Function<void(jsg::Lock&)>&& action) const;
 
   // Like scheduleAction(), but for callers where a destroyed target context is an expected,
@@ -110,17 +117,16 @@ class DeleteQueue: public kj::AtomicRefcounted {
   // and deletions are dropped. Useful for reclaiming registrations that target this queue.
   bool isDefunct() const;
 
+  // The number of actions queued. For tests.
+  size_t getQueuedActionCountForTest() const;
+
   struct State {
     kj::Vector<OwnedObject*> queue;
     // Actions that some other IoContext has requested be executed in this IoContext. When
     // adding an action to this list, crossThreadFulfiller should be fulfilled, signaling the
-    // target IoContext to wake up and run actions. After draining the actions queue, the target
-    // IoContext should replace crossThreadFulfiller with a new one which will wake it up again.
+    // target IoContext to wake up and run actions. See scheduleAction() for when they run.
     //
     // In particular, these actions are used to implement cross-context promise resolution.
-    //
-    // Keep in mind the IoContext could be destroyed before the cross-thread signal runs, in
-    // which case the actions will never run.
     kj::Vector<kj::Function<void(jsg::Lock&)>> actions;
     kj::Maybe<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> crossThreadFulfiller;
   };
@@ -145,9 +151,22 @@ class DeleteQueue: public kj::AtomicRefcounted {
   template <typename T>
   SpecificOwnedObject<T>* addObjectImpl(kj::Own<T> obj, OwnedObjectList& ownedObjects) const;
 
+  // Installs a fresh cross-thread signal, returning a promise that resolves once an action is
+  // scheduled. Scheduling an action requires a signal to be installed, so the owning IoContext
+  // arms one before anything can schedule, and re-arms after consuming one to keep hearing about
+  // later actions; the previous signal must no longer be pending. Once the queue is defunct, the
+  // returned promise never resolves.
   kj::Promise<void> resetCrossThreadSignal() const;
 
+  // Moves the queued actions out of the queue, so that the owning IoContext runs them without the
+  // queue's lock held. An action is free to schedule another action on this queue.
+  kj::Array<kj::Function<void(jsg::Lock&)>> takeActions() const;
+
+  // True if any actions are queued.
+  bool hasQueuedActions() const;
+
   friend class IoContext;
+  friend class IoContext_IncomingRequest;
 };
 
 // Object which can push actions into a specific DeleteQueue then signal its
@@ -158,8 +177,8 @@ class IoCrossContextExecutor {
  public:
   IoCrossContextExecutor(kj::Arc<DeleteQueue> deleteQueue): deleteQueue(kj::mv(deleteQueue)) {}
 
-  // Tries to execute the specified action to the owning IoContext.
-  // The target IoContext will be signaled to run the action as soon as it is able.
+  // Schedules the specified action to run in the target IoContext. See
+  // DeleteQueue::scheduleAction() for when it runs.
   void execute(jsg::Lock& js, kj::Function<void(jsg::Lock&)>&& action);
 
   // True if the IoContext this executor targets is the calling thread's current IoContext —
@@ -174,6 +193,9 @@ class IoCrossContextExecutor {
 
   // True if the target IoContext has been destroyed, i.e. tryExecute() would drop the action.
   bool isTargetDestroyed() const;
+
+  // The number of actions queued for the target IoContext. For tests.
+  size_t getQueuedActionCountForTest() const;
 
  private:
   friend class IoContext;
@@ -221,21 +243,7 @@ class DeleteQueuePtr {
  public:
   DeleteQueuePtr(kj::Arc<DeleteQueue> queue): queue(kj::mv(queue)) {}
   KJ_DISALLOW_COPY_AND_MOVE(DeleteQueuePtr);
-  ~DeleteQueuePtr() noexcept(false) {
-    auto ptr = queue.get();
-    if (ptr != nullptr) {
-      auto lock = ptr->crossThreadDeleteQueue.lockExclusive();
-      KJ_IF_SOME(state, *lock) {
-        // The delete queue state may include a kj::CrossThreadPromiseFulfiller that
-        // needs to be destroyed. To do so, we need to allow async destructors here.
-        // We only want to destroy the crossThreadFulfiller in this scope tho, not
-        // everything that may be in the queue.
-        kj::AllowAsyncDestructorsScope scope;
-        state.crossThreadFulfiller = kj::none;
-      }
-      *lock = kj::none;
-    }
-  }
+  ~DeleteQueuePtr() noexcept(false);
   kj::Arc<DeleteQueue> queue;
 };
 

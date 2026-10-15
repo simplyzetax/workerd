@@ -121,7 +121,11 @@ subscription armed via `subscribeToRpcAbort()`, which happens automatically when
 listener, `onabort` handler, or any native registration is added. Only the receiving
 request's context can arm it — the underlying promise belongs to that request — so arming
 requested from any other context is routed there through the signal's
-`IoCrossContextExecutor` and takes effect on the receiving request's next turn. If the
+`IoCrossContextExecutor` and takes effect on the receiving request's next turn, or, if the
+receiver is an actor between events, at its next event. The signal queues only the first such
+request, so registrations made in the meantime can't pile up requests in an idle receiver
+(asserted by `anIdleActorQueuesOneSubscriptionRequestPerSignal` in
+`src/workerd/api/tests/actor-cross-context-promise-test.js`). If the
 receiving request is already gone, the routing is dropped: no delivery is possible anymore.
 Polling stays accurate regardless (if the peer could still abort, that request's teardown
 wrote an implicit connection-lost abort into the box), and registrations made after that

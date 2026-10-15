@@ -1494,6 +1494,11 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::Promise<void> deleteQueueSignalTask;
   static kj::Promise<void> startDeleteQueueSignalTask(IoContext* context);
 
+  // Runs the cross-context actions queued on deleteQueue like any other event: under the input lock
+  // and the current IncomingRequest. If the run loses its request while it waits for a lock, the
+  // actions stay queued for the next request. Any other failure aborts this context.
+  kj::Promise<void> runQueuedActions();
+
   friend class Finalizeable;
   friend class DeleteQueue;
   template <typename T>
