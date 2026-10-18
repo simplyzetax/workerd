@@ -8,6 +8,7 @@
 
 #include <workerd/api/global-scope.h>
 #include <workerd/util/entropy.h>
+#include <workerd/util/weak-refs.h>
 
 #include <kj/compat/http.h>
 #include <kj/encoding.h>
