@@ -1651,3 +1651,9 @@ wd_cli_test(
         "//src/workerd/server:workerd_cross",
     ],
 )
+
+wd_test(
+    src = "response-json-test.wd-test",
+    args = ["--experimental"],
+    data = ["response-json-test.js"],
+)
