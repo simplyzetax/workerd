@@ -511,6 +511,17 @@ IoContext::IncomingRequest::~IoContext_IncomingRequest() noexcept(false) {
   }
 }
 
+void IoContext::IncomingRequest::cancelPendingWorkForHibernation() {
+  // This request must still be current: canceled work may have spans that read its timer.
+  if (!context->canceler.isEmpty()) {
+    context->canceler.cancel(
+        JSG_KJ_EXCEPTION(FAILED, Error, "The Durable Object is hibernating."));
+  }
+  context->timeoutManager->cancelAll();
+  context->waitUntilTasks.clear();
+  waitedForWaitUntil = true;
+}
+
 InputGate::Lock IoContext::getInputLock() {
   return KJ_ASSERT_NONNULL(currentInputLock, "no input lock available in this context")
       .addRef(getCurrentTraceSpan());

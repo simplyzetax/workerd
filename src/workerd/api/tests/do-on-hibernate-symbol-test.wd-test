@@ -9,10 +9,12 @@ const unitTests :Workerd.Config = (
       compatibilityFlags = ["experimental", "nodejs_compat"],
       durableObjectNamespaces = [
         (className = "OnHibernateObject", uniqueKey = "do-on-hibernate-symbol"),
+        (className = "ThrowingReadObject", uniqueKey = "do-on-hibernate-throwing-read"),
       ],
       durableObjectStorage = (inMemory = void),
       bindings = [
         (name = "ns", durableObjectNamespace = "OnHibernateObject"),
+        (name = "throwingRead", durableObjectNamespace = "ThrowingReadObject"),
       ],
     )),
     (name = "do-on-hibernate-symbol-unflagged-test", worker = (

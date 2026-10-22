@@ -340,6 +340,36 @@ KJ_TEST("IoContext::IncomingRequest::drain() releases a superseded (non-front) r
   fixture.drainAndDestroy(kj::mv(second));
 }
 
+KJ_TEST("cancelPendingWorkForHibernation() cancels pending work but keeps abort watchers armed") {
+  TestFixture fixture({.actorId = Worker::Actor::Id(kj::str("hibernate-test"))});
+  auto& waitScope = fixture.getWaitScope();
+  auto context = fixture.newIoContext();
+  auto request = fixture.newIncomingRequest(*context);
+
+  bool taskCanceled = false;
+  context->addTask(
+      kj::Promise<void>(kj::NEVER_DONE).attach(kj::defer([&]() { taskCanceled = true; })));
+
+  kj::Function<kj::Promise<void>()> callback;
+  context
+      ->run([&callback](Worker::Lock&, IoContext& context) {
+    callback = context.makeReentryCallback(
+        [](Worker::Lock&, IoContext&) { return kj::Promise<void>(kj::NEVER_DONE); });
+  }).wait(waitScope);
+  auto pendingCallback = callback();
+  KJ_EXPECT(!pendingCallback.poll(waitScope));
+
+  bool watcherCanceled = false;
+  context->abortWhen(
+      kj::Promise<void>(kj::NEVER_DONE).attach(kj::defer([&]() { watcherCanceled = true; })));
+
+  request->cancelPendingWorkForHibernation();
+
+  KJ_EXPECT(taskCanceled);
+  KJ_EXPECT_THROW_MESSAGE("The Durable Object is hibernating.", pendingCallback.wait(waitScope));
+  KJ_EXPECT(!watcherCanceled);
+}
+
 KJ_TEST("ambient IoContext is hidden while another V8 isolate is entered") {
   auto io = kj::setupAsyncIo();
   TestFixture outer({.waitScope = io.waitScope, .useRealTimers = false});
