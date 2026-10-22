@@ -150,6 +150,107 @@ fn unlocked_drop_is_deferred_until_the_next_lock() {
     });
 }
 
+/// A `Global` is `Send`: another thread may drop it while this one holds the isolate lock and
+/// creates handles. The drop is queued, and replayed when the isolate is locked next. One of the
+/// `Global`s has been visited by GC, so its handles are boxed, and GC may write into the box
+/// while it waits in the queue.
+#[test]
+fn drop_on_another_thread_is_deferred_until_the_next_lock() {
+    COUNTED_DROPS.store(0, Ordering::SeqCst);
+
+    let harness = crate::Harness::new();
+    let mut wrapper: Option<v8::Global<v8::Value>> = None;
+    let mut visited: Option<v8::Global<v8::Value>> = None;
+    let mut holder = None;
+    harness.run_in_context(|lock, ctx| {
+        let resource = jsg::Rc::new(Counted);
+        wrapper = Some(resource.clone().to_js(lock).to_global(lock));
+        drop(resource);
+
+        let (resource, _) = holder_in_traced_mode(lock, ctx);
+        visited = resource.handle.take();
+        holder = Some(resource);
+        Ok(())
+    });
+    let wrapper = wrapper.expect("created in the context");
+    let visited = visited.expect("set in the context");
+
+    harness.run_in_context(|lock, _ctx| {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let dropper = std::thread::spawn({
+            let barrier = std::sync::Arc::clone(&barrier);
+            move || {
+                barrier.wait();
+                drop(wrapper);
+                drop(visited);
+            }
+        });
+        barrier.wait();
+        // Meanwhile this thread, which holds the lock, keeps creating and dropping handles.
+        for _ in 0..1000 {
+            drop(lock.new_object().to_global(lock));
+        }
+        dropper.join().expect("the drops do not panic");
+        assert_eq!(lock.deferred_handle_count(), 2);
+        crate::Harness::request_gc(lock);
+        assert_eq!(COUNTED_DROPS.load(Ordering::SeqCst), 0);
+        Ok(())
+    });
+
+    harness.run_in_context(|lock, _ctx| {
+        assert_eq!(lock.deferred_handle_count(), 0);
+        crate::Harness::request_gc(lock);
+        assert_eq!(COUNTED_DROPS.load(Ordering::SeqCst), 1);
+        Ok(())
+    });
+    drop(holder);
+}
+
+/// `jsg::Rc::new` takes no `Lock`, so a thread without the isolate lock can put a `Global` that
+/// GC has visited into a new resource, whose first strong reference visits the `Global`. That
+/// visit must leave the handles alone while this thread holds the lock and creates handles: the
+/// traced node is still in use afterwards, and the `Global` goes on working under the lock.
+#[test]
+fn visited_global_put_into_a_resource_on_another_thread_is_left_alone() {
+    let harness = crate::Harness::new();
+    harness.run_in_context(|lock, ctx| {
+        let (resource, baseline) = holder_in_traced_mode(lock, ctx);
+        let with_global = crate::Harness::used_global_handles_size(lock);
+        let taken = resource.handle.take().expect("set above");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mover = std::thread::spawn({
+            let barrier = std::sync::Arc::clone(&barrier);
+            move || {
+                barrier.wait();
+                let holder = jsg::Rc::new(HandleHolder {
+                    handle: Cell::new(Some(taken)),
+                });
+                holder.handle.take().expect("set above")
+            }
+        });
+        barrier.wait();
+        // Meanwhile this thread, which holds the lock, keeps creating and dropping handles.
+        for _ in 0..1000 {
+            drop(lock.new_object().to_global(lock));
+        }
+        let taken = mover.join().expect("the move does not panic");
+        assert_eq!(
+            crate::Harness::used_global_handles_size(lock),
+            with_global,
+            "the traced node is still in use"
+        );
+        assert!(taken.as_local(lock).is_object());
+
+        resource.handle.set(Some(taken));
+        crate::Harness::request_gc(lock);
+        assert_eq!(crate::Harness::used_global_handles_size(lock), with_global);
+        drop(resource.handle.take());
+        assert_eq!(crate::Harness::used_global_handles_size(lock), baseline);
+        Ok(())
+    });
+}
+
 /// A resource that is still wrapped when its isolate is torn down is dropped by the teardown,
 /// outside any GC, together with the `Global` it owns. GC put that `Global` in traced mode
 /// while the wrapper was reachable.

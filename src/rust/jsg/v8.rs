@@ -2937,8 +2937,11 @@ pub struct Global<T> {
     /// The state of the isolate the handle was created in. Every use checks that the lock
     /// belongs to that isolate, and a drop checks that the isolate is still alive.
     state: Arc<IsolateState>,
-    /// `*const T` makes `Global` neither `Send` nor `Sync`.
-    _marker: PhantomData<*const T>,
+    /// `fn() -> T` leaves `Send` and `Sync` to the other fields: a `Global` is `Send`, since it
+    /// may be dropped on any thread (see [`IsolateState`]), a visit outside GC on a thread
+    /// without the isolate lock leaves it alone (see [`GcVisitor::visit_global`]), and every
+    /// other use takes a `Lock` of its isolate. It is not `Sync`, because of the `UnsafeCell`.
+    _marker: PhantomData<fn() -> T>,
 }
 
 // Common implementations for all Global<T>
