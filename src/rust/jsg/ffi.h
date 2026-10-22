@@ -27,6 +27,7 @@ struct MaybeLocal;
 struct Global;
 struct TracedReference;
 struct Realm;
+struct IsolateState;
 struct GcVisitor;
 enum class BackingStoreInitializationMode : ::std::uint8_t;
 enum class ExceptionType : ::std::uint8_t;
@@ -95,10 +96,15 @@ void wrappable_visit_ref(
 /// Both are mutated in-place by this function.
 void wrappable_visit_global(GcVisitor* visitor, uintptr_t* global, TracedReference& traced);
 
-/// Resets a `v8::TracedReference`, releasing the weak GC handle.
-/// Must be called when a `Global<T>` is dropped in traced mode to avoid
-/// leaking a live `v8::TracedReference`.
+/// The isolate of the object that `visitor` is visiting (`jsg::GcVisitor::getIsolate`), or null.
+Isolate* gc_visitor_isolate(GcVisitor* visitor);
+
+/// Resets a `v8::TracedReference`, freeing its node, which must be live.
 void traced_reference_reset(TracedReference& traced);
+
+/// Makes a weak `v8::Global` strong again, if it is not empty. `global` points to the `ptr`
+/// field of the `ffi::Global`.
+void global_clear_weak(uintptr_t* global);
 
 // Local<T>
 Global local_to_global(Isolate* isolate, Local value);
@@ -347,8 +353,8 @@ Local function_template_get_function(Isolate* isolate, const Global& tmpl);
 
 // Realm
 Realm* realm_from_isolate(Isolate* isolate);
-void realm_attach(Isolate* isolate, Realm& realm);
-void realm_detach(Isolate* isolate);
+void realm_attach(Isolate* isolate, Realm& realm, const IsolateState& state);
+void realm_detach(Isolate* isolate, const IsolateState& state);
 
 // Errors
 // Builds an exception whose message is raw bytes interpreted as UTF-8. Invalid
@@ -363,6 +369,7 @@ void isolate_throw_error(Isolate* isolate, ::rust::Str message);
 void isolate_throw_internal_error(Isolate* isolate, ::rust::Str internalMessage);
 void isolate_terminate_execution(Isolate* isolate);
 bool isolate_is_locked(Isolate* isolate);
+bool isolate_is_marking(Isolate* isolate);
 bool isolate_in_context(Isolate* isolate);
 void ignore_leak(size_t ptr);
 

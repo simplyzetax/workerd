@@ -63,6 +63,7 @@ pub use wrappable::Traced;
 mod ffi {
     extern "Rust" {
         type Realm;
+        type IsolateState;
 
         /// Create a fully-initialized Realm with feature flags.
         /// `feature_flags_data` is canonical (single-segment, no segment table) Cap'n Proto
@@ -85,6 +86,11 @@ mod ffi {
         /// hook, which `IsolateBase::Lock` does whenever it locks the isolate.
         /// The isolate must be locked by the calling thread, with no Rust `Lock` in use.
         unsafe fn realm_drain(isolate: *mut Isolate);
+
+        /// Records the start or the end of a garbage collection that can free traced nodes;
+        /// see `IsolateState::gc_epoch`. Called from the GC prologue and epilogue callbacks
+        /// that `realm_attach` registers.
+        fn isolate_state_note_gc(state: &IsolateState);
     }
 
     unsafe extern "C++" {
@@ -96,11 +102,12 @@ mod ffi {
 
         // Realm
         pub unsafe fn realm_from_isolate(isolate: *mut Isolate) -> *mut Realm;
-        /// Stores `realm` in the isolate's data slot and installs the deferred action hook
-        /// that calls `realm_drain`.
-        pub unsafe fn realm_attach(isolate: *mut Isolate, realm: &mut Realm);
+        /// Stores `realm` in the isolate's data slot, installs the deferred action hook that
+        /// calls `realm_drain`, and registers GC callbacks that call `isolate_state_note_gc`
+        /// with `state`, which must stay alive until `realm_detach`.
+        pub unsafe fn realm_attach(isolate: *mut Isolate, realm: &mut Realm, state: &IsolateState);
         /// Undoes `realm_attach`.
-        pub unsafe fn realm_detach(isolate: *mut Isolate);
+        pub unsafe fn realm_detach(isolate: *mut Isolate, state: &IsolateState);
     }
 }
 
@@ -957,12 +964,13 @@ pub trait Struct: Type {}
 /// resource are dropped and no JS references remain, V8 GC collects the wrapper and the
 /// `CppgcShim` destruction triggers cleanup of the underlying `Wrappable`.
 ///
-/// A Realm attaches itself to its isolate: it is stored in the isolate's data slot, and it
+/// A Realm attaches itself to its isolate: it is stored in the isolate's data slot, it
 /// installs the hook through which the isolate lock replays the handle releases that
-/// `Global`s deferred for want of the lock. It must be dropped under the isolate lock, before
-/// the isolate is disposed: dropping it detaches it and closes the isolate's
-/// [`IsolateState`], after which the `Global`s of the isolate leave their handles to
-/// `v8::Isolate::Dispose`.
+/// `Global`s deferred for want of the lock, and it has V8 report to the [`IsolateState`]
+/// the garbage collections that can free traced handles. It must be dropped under the
+/// isolate lock, before the isolate is disposed: dropping it detaches it and closes the
+/// isolate's [`IsolateState`], after which the `Global`s of the isolate leave their
+/// handles to `v8::Isolate::Dispose`.
 pub struct Realm {
     isolate: v8::IsolatePtr,
     /// Shared with every `Global` of the isolate, which identifies its isolate by it.
@@ -1019,7 +1027,7 @@ impl Drop for Realm {
         let isolate = unsafe { Isolate::from_raw(self.isolate.as_ffi()) };
         self.state.close(isolate);
         // SAFETY: the isolate is valid and locked, and this Realm is the one attached to it.
-        unsafe { ffi::realm_detach(isolate.as_ffi()) };
+        unsafe { ffi::realm_detach(isolate.as_ffi(), &self.state) };
     }
 }
 
@@ -1033,10 +1041,16 @@ unsafe fn realm_create(isolate: *mut v8::ffi::Isolate, feature_flags_data: &[u8]
     // SAFETY: isolate pointer is valid and locked (guaranteed by C++ caller).
     let mut realm =
         unsafe { Box::new(Realm::new(v8::IsolatePtr::from_ffi(isolate), feature_flags)) };
-    // SAFETY: as above; the Realm keeps its address for as long as it is attached, as it
-    // lives in the `Box` until `Realm::drop` detaches it.
-    unsafe { ffi::realm_attach(isolate, &mut realm) };
+    let state = Arc::clone(&realm.state);
+    // SAFETY: as above; the Realm keeps its address, and its state, for as long as it is
+    // attached, as it lives in the `Box` until `Realm::drop` detaches it.
+    unsafe { ffi::realm_attach(isolate, &mut realm, &state) };
     realm
+}
+
+/// See the bridge declaration.
+fn isolate_state_note_gc(state: &IsolateState) {
+    state.note_gc();
 }
 
 /// See the bridge declaration.

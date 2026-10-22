@@ -178,6 +178,20 @@ calls whenever it locks the isolate, as workerd and the test harness do. A bare 
 or relocking after a `v8::Unlocker`, does not replay it; the handles wait for the next
 `IsolateBase::Lock`.
 
+A `Global` in traced mode also holds a `v8::TracedReference`, whose node V8 frees at the end of
+any GC that can free traced nodes and did not trace it: a full mark-compact, or a minor
+mark-sweep when cppgc's young generation is enabled. A `Global` taken out of its resource, for
+instance by `Cell::take()`, is traced by nothing, and nothing tells it that it moved, the way C++
+JSG's `jsg::Data` move constructor re-strengthens its handle. So the isolate state counts the GCs
+that can free traced nodes, and each `Global` records the last one in which its node was known
+to be live. A drop resets a node that is still live, as C++ JSG does; one that GC may have freed
+is forgotten, and so is it when GC next visits the `Global`, which then installs a new node.
+
+A `Global` taken out of its resource is still weak, and nothing traces its value: unless
+something else keeps the value alive, any GC from then on may free it, which leaves the
+`Global` empty, and `as_local` on it panics. Put the `Global` back, or hold the value through
+another handle, before a GC can run.
+
 `Global<T>` fields on `#[jsg_resource]` structs participate in GC tracing when visited via `GcVisitor::visit_global`. This enables the garbage collector to detect and collect back-reference cycles — for example, a resource that stores a JS callback which closes over the resource's own JS wrapper:
 
 ```rust

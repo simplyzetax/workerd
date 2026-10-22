@@ -12,7 +12,9 @@
 #include <workerd/rust/jsg/lib.rs.h>
 #include <workerd/rust/jsg/v8.rs.h>
 
+#include <cppgc/heap-state.h>
 #include <kj-rs/convert.h>
+#include <v8-cppgc.h>
 
 #include <kj/common.h>
 #include <kj/string.h>
@@ -879,8 +881,19 @@ void wrappable_visit_global(GcVisitor* visitor, uintptr_t* global, TracedReferen
   gcVisitor->visit(strongHandle, tracedHandle);
 }
 
+Isolate* gc_visitor_isolate(GcVisitor* visitor) {
+  return gc_visitor_from_ffi(visitor)->getIsolate();
+}
+
 void traced_reference_reset(TracedReference& traced) {
   traced_ref_from_ffi(traced).Reset();
+}
+
+void global_clear_weak(uintptr_t* global) {
+  auto& handle = *reinterpret_cast<v8::Global<v8::Value>*>(global);
+  if (!handle.IsEmpty()) {
+    handle.ClearWeak<void>();
+  }
 }
 
 void wrappable_visit_ref(
@@ -1148,14 +1161,29 @@ namespace {
 void drainRealm(v8::Isolate* isolate) {
   realm_drain(isolate);
 }
+
+// The garbage collections that can free traced nodes; see `IsolateState::gc_epoch`.
+constexpr auto TRACED_NODE_GC_TYPES =
+    static_cast<v8::GCType>(v8::kGCTypeMarkSweepCompact | v8::kGCTypeMinorMarkSweep);
+
+// Registered as both GC prologue and epilogue callback, with the IsolateState as data.
+void noteGc(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* data) noexcept {
+  isolate_state_note_gc(*static_cast<const IsolateState*>(data));
+}
 }  // namespace
 
-void realm_attach(Isolate* isolate, Realm& realm) {
+void realm_attach(Isolate* isolate, Realm& realm, const IsolateState& state) {
   isolate->SetData(::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, &realm);
   ::workerd::jsg::IsolateBase::from(isolate).setDeferredActionHook(&drainRealm);
+  auto* data = const_cast<IsolateState*>(&state);
+  isolate->AddGCPrologueCallback(&noteGc, data, TRACED_NODE_GC_TYPES);
+  isolate->AddGCEpilogueCallback(&noteGc, data, TRACED_NODE_GC_TYPES);
 }
 
-void realm_detach(Isolate* isolate) {
+void realm_detach(Isolate* isolate, const IsolateState& state) {
+  auto* data = const_cast<IsolateState*>(&state);
+  isolate->RemoveGCEpilogueCallback(&noteGc, data);
+  isolate->RemoveGCPrologueCallback(&noteGc, data);
   ::workerd::jsg::IsolateBase::from(isolate).setDeferredActionHook(nullptr);
   isolate->SetData(::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, nullptr);
 }
@@ -1229,6 +1257,11 @@ void ignore_leak(size_t ptr) {
 
 bool isolate_is_locked(Isolate* isolate) {
   return v8::Locker::IsLocked(isolate);
+}
+
+bool isolate_is_marking(Isolate* isolate) {
+  auto* cppHeap = isolate->GetCppHeap();
+  return cppHeap != nullptr && cppgc::subtle::HeapState::IsMarking(cppHeap->GetHeapHandle());
 }
 
 bool isolate_in_context(Isolate* isolate) {
