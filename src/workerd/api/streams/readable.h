@@ -583,7 +583,7 @@ kj::Own<ReadableStreamSource> newNoDeferredProxyReadableStream(
 RpcSerializerExternalHandler& requireReadableStreamRpcSerializer(jsg::Serializer& serializer);
 
 // Builds the wire plumbing for transferring a readable stream over RPC: pushes a ByteStream to
-// the peer, writes the external-table entry describing it (encoding plus expected length, when
+// the peer, writes the external-table entry describing it (encoding plus identity length, when
 // known), and returns the local sink the stream's remaining content must be pumped into (ending
 // the sink when the stream ends). Shared by ReadableStream::serialize() and JsReadableStream's
 // TypeScript arm, which differ only in how the encoding/length are obtained and how the pump is
@@ -591,7 +591,8 @@ RpcSerializerExternalHandler& requireReadableStreamRpcSerializer(jsg::Serializer
 kj::Own<WritableStreamSink> newReadableStreamSerializeSink(
     RpcSerializerExternalHandler& externalHandler,
     StreamEncoding encoding,
-    kj::Maybe<uint64_t> expectedLength);
+    kj::Maybe<uint64_t> encodedLength,
+    kj::Maybe<uint64_t> identityLength);
 
 // Materializes a readable stream received over RPC from its external-table entry: adopts the
 // pushed ByteStream, wraps it as a system stream of the peer's declared encoding (with deferred

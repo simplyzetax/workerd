@@ -279,6 +279,22 @@ When `pumpTo()` is called on the adapter:
 4. If the pump promise is dropped first (e.g. client disconnect), cancels the stream
    (undefined reason) from a waitUntil task, so the source's cancel algorithm runs
 
+## RPC stream length
+
+Readable-stream RPC descriptors carry the remaining identity-byte length separately
+from the preferred wire encoding and the pushed byte stream's encoded length. The
+receiver installs this metadata on its system stream before constructing either
+stream implementation, so length queries do not depend on the push resolving.
+Absent metadata preserves the underlying transport's length behavior; known zero
+is distinct from unknown, and the metadata retains the full `UInt64` range.
+
+The system source decrements its identity count after decoded reads and copies the
+remaining count independently to tee branches. Optimized pumps may bypass decoded
+reads, including for compressed passthrough: they consume the source's length and
+report zero only after successful completion. Identity metadata is never used as a
+compressed-byte length. Disturbed and locked streams remain ineligible for RPC
+transfer.
+
 ## Safety Pattern Catalog
 
 ### Pattern: State Machine (`StateMachine<>`)
