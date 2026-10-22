@@ -27,6 +27,18 @@
 //! then wait for the next `IsolateBase::Lock`. The `Realm` closes the state when it is
 //! dropped, under the isolate lock, before the isolate is disposed.
 //!
+//! # Boxed handles
+//!
+//! A `Global` that GC has visited keeps its handles in a box (see
+//! [`Handles`](crate::v8::Handles)), because V8 writes into the slot of a weak handle when its
+//! value dies, during any GC. GC runs on the thread holding the isolate lock, so a box is only
+//! read under the lock, and freed only once its strong handle has been reset, which is when V8
+//! forgets the slot. A release without the lock queues the box. After the state is closed the
+//! handles are no longer reset, but GC can still run before the isolate is disposed: during
+//! `IsolateBase::dropWrappers`, while `v8::Isolate::Dispose` tears the heap down, or whenever
+//! V8 flags ask for it. So the box of a `Global` dropped then is parked, and freed once
+//! `~IsolateBase` reports, through a hook the `Realm` set, that the isolate is disposed.
+//!
 //! # Traced handles
 //!
 //! When GC visits a `Global` inside a resource that is only reachable through its wrapper, it
@@ -61,12 +73,14 @@ use std::sync::atomic::Ordering;
 use crate::Isolate;
 use crate::scope::scope_owner;
 use crate::v8;
+use crate::v8::HandleSlot;
+use crate::v8::Handles;
 use crate::v8::ffi;
 
 /// What the handles of an isolate need to know about it after their scopes are gone.
 pub struct IsolateState {
     /// Compared with the isolate whose scopes are open on the current thread, and dereferenced
-    /// only while the isolate is known to be alive: while `deferred` is locked and `closed` is
+    /// only while the isolate is known to be alive: while `queues` is locked and `closed` is
     /// not set, since [`close`](Self::close) sets `closed` under that same lock, before the
     /// isolate is disposed.
     isolate: *mut ffi::Isolate,
@@ -75,9 +89,23 @@ pub struct IsolateState {
     /// See [`gc_epoch`](Self::gc_epoch). Only accessed by the thread holding the isolate lock,
     /// whose hand-over orders the accesses.
     gc_epoch: AtomicU64,
-    /// Strong handles of `Global`s that were dropped without the isolate lock, waiting for
-    /// the next lock.
-    deferred: Mutex<Vec<ffi::Global>>,
+    queues: Mutex<Queues>,
+}
+
+#[derive(Default)]
+struct Queues {
+    /// Handles of `Global`s that were dropped without the isolate lock, waiting for the next
+    /// lock.
+    deferred: Vec<Handles>,
+    /// Boxes of `Global`s that were dropped after the state was closed, waiting for the
+    /// isolate to be disposed.
+    #[expect(
+        clippy::vec_box,
+        reason = "V8 may write into a box until the isolate is disposed"
+    )]
+    parked: Vec<Box<HandleSlot>>,
+    /// Set once the isolate is disposed, after which boxes are freed at once.
+    disposed: bool,
 }
 
 // SAFETY: `isolate` is a raw pointer that is only compared, or dereferenced for
@@ -99,7 +127,7 @@ impl IsolateState {
             isolate: isolate.as_ffi(),
             closed: AtomicBool::new(false),
             gc_epoch: AtomicU64::new(0),
-            deferred: Mutex::new(Vec::new()),
+            queues: Mutex::new(Queues::default()),
         })
     }
 
@@ -117,7 +145,7 @@ impl IsolateState {
             // A scope of the isolate is open on this thread, so this thread holds its lock.
             return true;
         }
-        let _deferred = self.lock_deferred();
+        let _queues = self.lock_queues();
         // `close` takes the queue's mutex before it sets `closed`, so the isolate is alive
         // until the guard is dropped. If this thread holds the lock, nothing can close the
         // state before it lets go of the lock.
@@ -181,56 +209,55 @@ impl IsolateState {
     ///
     /// Under the isolate lock the strong handle is reset at once, and so is the traced handle
     /// if its node is known to be live (see the module documentation). Without the lock the
-    /// strong handle is queued, and [`drain`](Self::drain) resets it the next time the isolate
-    /// is locked, so until then it keeps its value alive. Once the isolate is closed the
-    /// handles are left to `v8::Isolate::Dispose`.
-    pub(crate) fn release(&self, strong: ffi::Global, traced: TracedHandle) {
-        if (strong.ptr == 0 && traced.reference.ptr == 0) || self.is_closed() {
+    /// handles are queued, and [`drain`](Self::drain) resets them the next time the isolate is
+    /// locked, so until then the strong handle keeps its value alive. Once the isolate is
+    /// closed the handles are left to `v8::Isolate::Dispose`, and a box is parked until then.
+    pub(crate) fn release(&self, handles: Handles) {
+        // GC never writes into an inline handle, so it may be read here. A box is read only
+        // under the isolate lock.
+        if matches!(handles, Handles::Inline(ffi::Global { ptr: 0 })) {
+            return;
+        }
+        if self.is_closed() {
+            self.park(handles);
             return;
         }
         if scope_owner::current() == self.isolate {
             // A scope of the isolate is open on this thread, so this thread holds its lock.
-            self.reset(strong, traced);
+            self.reset(handles);
             return;
         }
-        let mut deferred = self.lock_deferred();
+        let mut queues = self.lock_queues();
         if self.is_closed() {
+            drop(queues);
+            self.park(handles);
             return;
         }
-        // `close` takes `deferred` before it sets `closed`, so the isolate is alive until the
+        // `close` takes `queues` before it sets `closed`, so the isolate is alive until the
         // guard is dropped.
         // SAFETY: the isolate is alive (see above), and `v8::Locker::IsLocked` may be called
         // from any thread.
         if unsafe { ffi::isolate_is_locked(self.isolate) } {
-            drop(deferred);
-            self.reset(strong, traced);
+            drop(queues);
+            self.reset(handles);
             return;
         }
-        // Only GC installs a traced reference, on a `Global` inside a resource, and V8 then
-        // writes into the strong handle's slot when its value dies, so such a `Global` must
-        // not be dropped without the lock while its slot moves with it. A resource drops its
-        // handles under the lock, as its own destruction is deferred to it. Nothing traces the
-        // node of a dropped `Global`, so V8 frees it at the next GC that can free traced nodes.
-        debug_assert_eq!(
-            traced.reference.ptr, 0,
-            "a Global in traced mode was dropped without the isolate lock"
-        );
-        deferred.push(strong);
+        queues.deferred.push(handles);
     }
 
     /// Resets the handles queued by [`release`](Self::release). The deferred action hook calls
     /// it whenever `IsolateBase::Lock` locks the isolate.
     pub(crate) fn drain(&self, _isolate: &mut Isolate) {
-        // The handles are reset outside the mutex, which only guards the queue itself.
-        let batch = std::mem::take(&mut *self.lock_deferred());
-        for strong in batch {
-            reset_strong(strong);
+        // The handles are reset outside the mutex, which only guards the queues themselves.
+        let batch = std::mem::take(&mut self.lock_queues().deferred);
+        for handles in batch {
+            self.reset(handles);
         }
     }
 
     /// The number of handles waiting for the next lock.
     pub(crate) fn deferred_count(&self) -> usize {
-        self.lock_deferred().len()
+        self.lock_queues().deferred.len()
     }
 
     /// Records that the isolate is about to be disposed, and resets the queued handles while
@@ -241,36 +268,66 @@ impl IsolateState {
     /// isolate can be reset concurrently.
     pub(crate) fn close(&self, _isolate: &mut Isolate) {
         let batch = {
-            let mut deferred = self.lock_deferred();
+            let mut queues = self.lock_queues();
             self.closed.store(true, Ordering::Release);
-            std::mem::take(&mut *deferred)
+            std::mem::take(&mut queues.deferred)
         };
-        for strong in batch {
-            reset_strong(strong);
+        for handles in batch {
+            self.reset(handles);
         }
     }
 
-    /// Resets a dropped `Global`'s handles. The isolate must be locked by this thread.
-    fn reset(&self, strong: ffi::Global, traced: TracedHandle) {
-        reset_strong(strong);
-        // SAFETY: the isolate is locked by this thread (guaranteed by caller), and `traced`
-        // belongs to it.
-        unsafe { traced.release(self.gc_epoch()) };
+    /// Records that the isolate has been disposed, and frees the parked boxes, which V8 can no
+    /// longer write into. Boxes released from now on are freed at once.
+    pub(crate) fn dispose(&self) {
+        let parked = {
+            let mut queues = self.lock_queues();
+            queues.disposed = true;
+            std::mem::take(&mut queues.parked)
+        };
+        drop(parked);
     }
 
-    fn lock_deferred(&self) -> MutexGuard<'_, Vec<ffi::Global>> {
-        // The mutex is only held around `Vec` operations, so a poisoned lock still guards a
-        // consistent queue.
-        self.deferred.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Leaves the handles of a `Global` dropped after the state was closed to `Dispose`. A box
+    /// stays allocated until then.
+    fn park(&self, handles: Handles) {
+        if let Handles::Boxed(slot) = handles {
+            let mut queues = self.lock_queues();
+            if !queues.disposed {
+                queues.parked.push(slot);
+            }
+        }
+    }
+
+    /// Resets a dropped `Global`'s handles, in place: a box is freed only afterwards, once V8
+    /// has forgotten its slot. The isolate must be locked by this thread.
+    fn reset(&self, handles: Handles) {
+        let mut handles = handles;
+        match &mut handles {
+            Handles::Inline(strong) => reset_strong(strong),
+            Handles::Boxed(slot) => {
+                reset_strong(&mut slot.strong);
+                let traced = std::mem::replace(&mut slot.traced, TracedHandle::EMPTY);
+                // SAFETY: the isolate is locked by this thread (guaranteed by caller), and
+                // `traced` belongs to it.
+                unsafe { traced.release(self.gc_epoch()) };
+            }
+        }
+    }
+
+    fn lock_queues(&self) -> MutexGuard<'_, Queues> {
+        // The mutex is only held around `Vec` operations, so a poisoned lock still guards
+        // consistent queues.
+        self.queues.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Resets a strong handle. The isolate must be locked by this thread.
+/// Resets a strong handle, in place. The isolate must be locked by this thread.
 #[expect(unsafe_code, reason = "resets a V8 handle")]
-fn reset_strong(mut strong: ffi::Global) {
+fn reset_strong(strong: &mut ffi::Global) {
     // SAFETY: the handle is valid and the isolate is locked (guaranteed by caller). `strong`
     // is not moved while pinned.
-    unsafe { ffi::global_reset(Pin::new_unchecked(&mut strong)) };
+    unsafe { ffi::global_reset(Pin::new_unchecked(strong)) };
 }
 
 /// A `Global`'s traced handle, and the [GC epoch](IsolateState::gc_epoch) through which its

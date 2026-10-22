@@ -41,10 +41,9 @@ Unsafe code is concentrated at FFI boundaries. Review every `unsafe` block and `
 
 - **V8 handle operations**: `Local::from_ffi()`/`into_ffi()`, isolate pointer dereference. These are
   safe only when the isolate is locked and the handle scope is active. Dropping a `jsg::v8::Global`
-  is the exception: it defers the reset to the next lock when the isolate is not locked (except
-  in traced mode, which needs the lock), and does nothing once the `Realm` is gone
-  (`src/rust/jsg/isolate_state.rs`). A shim that resets a handle itself must only run under the
-  lock.
+  is the exception: it defers the reset to the next lock when the isolate is not locked, and does
+  nothing once the `Realm` is gone (`src/rust/jsg/isolate_state.rs`). A shim that resets a handle
+  itself must only run under the lock.
 - **Resource wrap/unwrap**: `Ref::into_raw()` leaks a ref-counted pointer as `usize`;
   `Ref::from_raw()` reconstructs it. These must be balanced — every `into_raw` needs exactly one
   `from_raw` to avoid leaks or double-frees.

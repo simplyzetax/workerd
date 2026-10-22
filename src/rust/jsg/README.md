@@ -166,9 +166,7 @@ depends on the state of the isolate, which the `Realm` shares with every `Global
 
 - Under the isolate lock, the handle is reset at once.
 - Without the lock, the handle is queued and reset the next time the isolate is locked, as C++
-  JSG's deferred destruction queue does. Until then it keeps its value alive. A `Global` that GC
-  has put in traced mode is the exception: it must be dropped under the lock, which debug builds
-  assert, because V8 may still write into its weak handle's slot.
+  JSG's deferred destruction queue does. Until then it keeps its value alive.
 - Once the isolate is being disposed, the handle is left alone: `v8::Isolate::Dispose` frees
   every handle of the isolate in bulk, and a reset after it would touch freed memory. The
   `Realm` is dropped under the lock, before `Dispose`, and closes the state then.
@@ -186,6 +184,13 @@ JSG's `jsg::Data` move constructor re-strengthens its handle. So the isolate sta
 that can free traced nodes, and each `Global` records the last one in which its node was known
 to be live. A drop resets a node that is still live, as C++ JSG does; one that GC may have freed
 is forgotten, and so is it when GC next visits the `Global`, which then installs a new node.
+
+Bitwise moves are also why the first GC visit moves a `Global`'s handles into a box. In traced
+mode the strong handle is weak, and V8 keeps the address of its slot to null it when the value
+dies; the box keeps that address valid however the `Global` itself moves, for example when the
+`Vec` holding it grows. The box lives until the strong handle has been reset. GC can still run
+after the `Realm` is dropped, so the box of a `Global` dropped then is kept until the isolate is
+disposed.
 
 A `Global` taken out of its resource is still weak, and nothing traces its value: unless
 something else keeps the value alive, any GC from then on may free it, which leaves the

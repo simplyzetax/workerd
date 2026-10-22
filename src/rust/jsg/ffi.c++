@@ -1170,6 +1170,12 @@ constexpr auto TRACED_NODE_GC_TYPES =
 void noteGc(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* data) noexcept {
   isolate_state_note_gc(*static_cast<const IsolateState*>(data));
 }
+
+// The IsolateBase dispose hook that a Realm sets when it is dropped, with the reference to
+// its IsolateState that it hands over as data.
+void disposeIsolateState(void* data) {
+  isolate_state_disposed(static_cast<const IsolateState*>(data));
+}
 }  // namespace
 
 void realm_attach(Isolate* isolate, Realm& realm, const IsolateState& state) {
@@ -1180,11 +1186,13 @@ void realm_attach(Isolate* isolate, Realm& realm, const IsolateState& state) {
   isolate->AddGCEpilogueCallback(&noteGc, data, TRACED_NODE_GC_TYPES);
 }
 
-void realm_detach(Isolate* isolate, const IsolateState& state) {
-  auto* data = const_cast<IsolateState*>(&state);
+void realm_detach(Isolate* isolate, const IsolateState* state) {
+  auto* data = const_cast<IsolateState*>(state);
   isolate->RemoveGCEpilogueCallback(&noteGc, data);
   isolate->RemoveGCPrologueCallback(&noteGc, data);
-  ::workerd::jsg::IsolateBase::from(isolate).setDeferredActionHook(nullptr);
+  auto& isolateBase = ::workerd::jsg::IsolateBase::from(isolate);
+  isolateBase.setDeferredActionHook(nullptr);
+  isolateBase.setDisposeHook(&disposeIsolateState, data);
   isolate->SetData(::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, nullptr);
 }
 

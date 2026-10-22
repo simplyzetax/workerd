@@ -407,7 +407,7 @@ pub fn function_template_of<'s, R: Resource + 'static>(
     unsafe {
         v8::Local::from_ffi(v8::ffi::function_template_get_function(
             isolate.as_ffi(),
-            constructor.as_ffi_ref(),
+            &constructor.as_ffi(),
         ))
     }
 }

@@ -91,6 +91,12 @@ mod ffi {
         /// see `IsolateState::gc_epoch`. Called from the GC prologue and epilogue callbacks
         /// that `realm_attach` registers.
         fn isolate_state_note_gc(state: &IsolateState);
+
+        /// Frees what the `Global`s of a disposed isolate left for its disposal; see
+        /// `IsolateState::dispose`. `~IsolateBase` calls it after `v8::Isolate::Dispose`,
+        /// through the hook that `realm_detach` installs, with the reference to the state that
+        /// `realm_detach` was given.
+        unsafe fn isolate_state_disposed(state: *const IsolateState);
     }
 
     unsafe extern "C++" {
@@ -106,8 +112,10 @@ mod ffi {
         /// calls `realm_drain`, and registers GC callbacks that call `isolate_state_note_gc`
         /// with `state`, which must stay alive until `realm_detach`.
         pub unsafe fn realm_attach(isolate: *mut Isolate, realm: &mut Realm, state: &IsolateState);
-        /// Undoes `realm_attach`.
-        pub unsafe fn realm_detach(isolate: *mut Isolate, state: &IsolateState);
+        /// Undoes `realm_attach`, and sets the `IsolateBase` dispose hook to one that hands `state`,
+        /// a reference to the state from `Arc::into_raw`, to `isolate_state_disposed` once the
+        /// isolate is disposed.
+        pub unsafe fn realm_detach(isolate: *mut Isolate, state: *const IsolateState);
     }
 }
 
@@ -970,7 +978,8 @@ pub trait Struct: Type {}
 /// the garbage collections that can free traced handles. It must be dropped under the
 /// isolate lock, before the isolate is disposed: dropping it detaches it and closes the
 /// isolate's [`IsolateState`], after which the `Global`s of the isolate leave their
-/// handles to `v8::Isolate::Dispose`.
+/// handles to `v8::Isolate::Dispose`. The isolate keeps the state alive until it is
+/// disposed.
 pub struct Realm {
     isolate: v8::IsolatePtr,
     /// Shared with every `Global` of the isolate, which identifies its isolate by it.
@@ -1026,8 +1035,10 @@ impl Drop for Realm {
         // (guaranteed by the embedder; see the type's documentation).
         let isolate = unsafe { Isolate::from_raw(self.isolate.as_ffi()) };
         self.state.close(isolate);
+        // The isolate gives this reference back once it is disposed.
+        let state = Arc::into_raw(Arc::clone(&self.state));
         // SAFETY: the isolate is valid and locked, and this Realm is the one attached to it.
-        unsafe { ffi::realm_detach(isolate.as_ffi(), &self.state) };
+        unsafe { ffi::realm_detach(isolate.as_ffi(), state) };
     }
 }
 
@@ -1051,6 +1062,17 @@ unsafe fn realm_create(isolate: *mut v8::ffi::Isolate, feature_flags_data: &[u8]
 /// See the bridge declaration.
 fn isolate_state_note_gc(state: &IsolateState) {
     state.note_gc();
+}
+
+/// See the bridge declaration.
+#[expect(
+    unsafe_code,
+    reason = "takes back the reference to the state that C++ held"
+)]
+unsafe fn isolate_state_disposed(state: *const IsolateState) {
+    // SAFETY: `state` comes from `Arc::into_raw` in `Realm::drop`, and C++ hands it back once.
+    let state = unsafe { Arc::from_raw(state) };
+    state.dispose();
 }
 
 /// See the bridge declaration.
