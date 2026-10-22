@@ -10,6 +10,7 @@ mod collections_gc;
 mod eval;
 mod function;
 mod gc;
+mod global_lifetime;
 mod harness;
 mod integer;
 mod isolates;

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use kj_rs::KjMaybe;
 
@@ -25,6 +26,7 @@ use crate::Member;
 use crate::ToJS;
 use crate::Traced;
 use crate::Type;
+use crate::isolate_state::IsolateState;
 use crate::v8;
 use crate::v8::ffi::Wrappable;
 
@@ -398,11 +400,7 @@ pub fn function_template_of<'s, R: Resource + 'static>(
     lock: &mut Lock<'s>,
 ) -> v8::Local<'s, v8::Function> {
     let isolate = lock.isolate();
-    let isolate_id = lock.isolate_id();
-    let constructor = lock
-        .realm()
-        .resources
-        .get_constructor::<R>(isolate, isolate_id);
+    let constructor = lock.realm().constructor_of::<R>();
     // SAFETY: `isolate` is valid and locked (Lock invariant). `constructor` is a valid
     // Global<FunctionTemplate> cached in the Realm. Inlined from `as_local_function` to
     // avoid re-borrowing `self` while `constructor` holds an immutable borrow through `realm()`.
@@ -502,23 +500,23 @@ impl Resources {
     pub(crate) fn get_constructor<R: Resource + 'static>(
         &mut self,
         isolate: v8::IsolatePtr,
-        isolate_id: crate::scope::IsolateId,
+        state: &Arc<IsolateState>,
     ) -> &v8::Global<v8::FunctionTemplate> {
         self.templates
             .entry(TypeId::of::<R>())
-            .or_insert_with(|| Self::create_resource_constructor::<R>(isolate, isolate_id))
+            .or_insert_with(|| Self::create_resource_constructor::<R>(isolate, state))
     }
 
     /// Creates a new V8 `FunctionTemplate` for resource type `R` via the C++ FFI.
     fn create_resource_constructor<R: Resource>(
         isolate: v8::IsolatePtr,
-        isolate_id: crate::scope::IsolateId,
+        state: &Arc<IsolateState>,
     ) -> v8::Global<v8::FunctionTemplate> {
         // SAFETY: Caller guarantees the isolate is valid and locked.
         let handle = unsafe {
             v8::ffi::create_resource_template(isolate.as_ffi(), &get_resource_descriptor::<R>())
         };
-        v8::Global::from_ffi_in(handle, isolate_id)
+        v8::Global::from_ffi_in(handle, Arc::clone(state))
     }
 
     /// Drains every cached resource-template handle, transferring ownership of each
