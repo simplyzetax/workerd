@@ -161,10 +161,22 @@ let global = str_value.to_global(lock);
 A persistent handle that outlives `HandleScope`s. Must be explicitly managed. Opening or cloning
 it in an isolate other than the one it was created in panics.
 
-Dropping a `Global` resets its V8 handle, unless its isolate is gone: a `Global` can outlive the
-isolate it was created in, and `v8::Isolate::Dispose` frees every handle of the isolate in bulk,
-so a drop after that leaves the handle alone. The `Realm` tells the isolate's `Global`s when it
-is dropped, which happens under the isolate lock, before the isolate is disposed.
+Dropping a `Global` resets its V8 handle, which needs the isolate lock; what the drop does
+depends on the state of the isolate, which the `Realm` shares with every `Global` of it:
+
+- Under the isolate lock, the handle is reset at once.
+- Without the lock, the handle is queued and reset the next time the isolate is locked, as C++
+  JSG's deferred destruction queue does. Until then it keeps its value alive. A `Global` that GC
+  has put in traced mode is the exception: it must be dropped under the lock, which debug builds
+  assert, because V8 may still write into its weak handle's slot.
+- Once the isolate is being disposed, the handle is left alone: `v8::Isolate::Dispose` frees
+  every handle of the isolate in bulk, and a reset after it would touch freed memory. The
+  `Realm` is dropped under the lock, before `Dispose`, and closes the state then.
+
+The queue is replayed from `IsolateBase::applyDeferredActions()`, which `IsolateBase::Lock`
+calls whenever it locks the isolate, as workerd and the test harness do. A bare `v8::Locker`,
+or relocking after a `v8::Unlocker`, does not replay it; the handles wait for the next
+`IsolateBase::Lock`.
 
 `Global<T>` fields on `#[jsg_resource]` structs participate in GC tracing when visited via `GcVisitor::visit_global`. This enables the garbage collector to detect and collect back-reference cycles — for example, a resource that stores a JS callback which closes over the resource's own JS wrapper:
 

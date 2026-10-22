@@ -347,6 +347,8 @@ Local function_template_get_function(Isolate* isolate, const Global& tmpl);
 
 // Realm
 Realm* realm_from_isolate(Isolate* isolate);
+void realm_attach(Isolate* isolate, Realm& realm);
+void realm_detach(Isolate* isolate);
 
 // Errors
 // Builds an exception whose message is raw bytes interpreted as UTF-8. Invalid

@@ -62,6 +62,12 @@ enum class GcType : uint8_t;
 // Triggers garbage collection for testing purposes.
 void request_gc(Isolate* isolate, GcType gc_type);
 
+// Calls `callback` with the isolate unlocked, then locks it again.
+void run_unlocked(Isolate* isolate, size_t data, ::rust::Fn<void(size_t)> callback);
+
+// v8::HeapStatistics::used_global_handles_size() of the isolate.
+size_t used_global_handles_size(Isolate* isolate);
+
 // Creates a V8 object with the C++ WORKERD_WRAPPABLE_TAG set in its internal fields.
 // Used to test that Rust unwrap correctly rejects non-Rust wrappable objects.
 ::workerd::rust::jsg::Local create_cpp_tagged_object(Isolate* isolate);

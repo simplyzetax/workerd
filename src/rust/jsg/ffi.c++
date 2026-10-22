@@ -1142,6 +1142,24 @@ Realm* realm_from_isolate(Isolate* isolate) {
   return realm;
 }
 
+namespace {
+// The IsolateBase deferred action hook of an isolate with a Rust Realm: resets the handles
+// that `Global`s dropped without the isolate lock left for the next lock.
+void drainRealm(v8::Isolate* isolate) {
+  realm_drain(isolate);
+}
+}  // namespace
+
+void realm_attach(Isolate* isolate, Realm& realm) {
+  isolate->SetData(::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, &realm);
+  ::workerd::jsg::IsolateBase::from(isolate).setDeferredActionHook(&drainRealm);
+}
+
+void realm_detach(Isolate* isolate) {
+  ::workerd::jsg::IsolateBase::from(isolate).setDeferredActionHook(nullptr);
+  isolate->SetData(::workerd::jsg::SetDataIndex::SET_DATA_RUST_REALM, nullptr);
+}
+
 // Errors
 namespace {
 Local exceptionCreateFromMessage(ExceptionType exception_type, v8::Local<v8::String> message) {
