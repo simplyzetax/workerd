@@ -1,0 +1,25 @@
+src/workerd/api/BUILD.bazel
+  s_844cd48bee09c0::t_531e97a32f3d1c 810-817
+src/workerd/api/web-socket-test.c++
+  s_844cd48bee09c0::t_ba6872645f3bda 1-142
+src/workerd/api/web-socket.c++
+  s_844cd48bee09c0::t_50664637942e94 1194-1199,1201-1208,1210-1213,1215-1247,1249,1254-1256,1258-1282
+src/workerd/api/web-socket.h
+  s_844cd48bee09c0::t_79014496ca3bd2 876-884
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2b8688ce747ccef5a813662af13f0447c75bc9c4",
+  "prompts": {},
+  "sessions": {
+    "s_844cd48bee09c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9841fe72-0153-4bde-bfec-d9d780af60b0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Finn <ernzerhofffinn@icloud.com>"
+    }
+  }
+}
